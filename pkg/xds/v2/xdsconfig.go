@@ -24,14 +24,18 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/rand"
-	"mosn.io/mosn/pkg/xds/conv"
+	"net"
 	"time"
+
+	"mosn.io/mosn/pkg/types"
+	"mosn.io/mosn/pkg/xds/conv"
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	envoy_api_v2_auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
 	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	bootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
 	ads "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
+	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -68,6 +72,8 @@ func (c *XDSConfig) loadADSConfig(dynamicResources *bootstrap.Bootstrap_DynamicR
 		log.DefaultLogger.Errorf("fail to get api source endpoint")
 		return err
 	}
+	c.updateSdsSourceEndpoint(config)
+
 	c.ADSConfig = config
 	return nil
 }
@@ -116,6 +122,60 @@ func (c *XDSConfig) getAPISourceEndpoint(source *core.ApiConfigSource) (*ADSConf
 	return config, nil
 }
 
+func (c *XDSConfig) updateSdsSourceEndpoint(config *ADSConfig) {
+	if config == nil || len(config.Services) == 0 || !featuregate.Enabled(featuregate.XdsMtlsEnable) {
+		// do nothing
+		return
+	}
+	var tlsContext *envoy_api_v2_auth.UpstreamTlsContext
+	for _, service := range config.Services {
+		if service.ClusterConfig == nil {
+			continue
+		}
+		endpoint, _ := service.ClusterConfig.GetEndpoint()
+		if len(endpoint) > 0 {
+			tlsContext = service.ClusterConfig.TlsContext
+			break
+		}
+	}
+	if tlsContext == nil {
+		// can not find the tlscontext,return
+		return
+	}
+	if tlsContext.CommonTlsContext == nil || tlsContext.CommonTlsContext.GetTlsCertificateSdsSecretConfigs() == nil {
+		// can not find the sds config
+		return
+	}
+	sdsConfigs := tlsContext.CommonTlsContext.GetTlsCertificateSdsSecretConfigs()
+	if len(sdsConfigs) == 0 {
+		// can not find the sds config
+		return
+	}
+	// get the first one
+	sdsConfig := sdsConfigs[0].SdsConfig
+
+	source, ok := sdsConfig.ConfigSourceSpecifier.(*core.ConfigSource_ApiConfigSource)
+	if !ok {
+		log.DefaultLogger.Errorf("can't use sds to generate client certificates , change to ConfigSource_ApiConfigSource fail")
+		return
+	}
+	grpcCluster, ok := source.ApiConfigSource.GrpcServices[0].TargetSpecifier.(*core.GrpcService_EnvoyGrpc_)
+	if !ok {
+		log.DefaultLogger.Errorf("can't use sds to generate client certificates , change to GrpcService_EnvoyGrpc_ fail ")
+		return
+	}
+	// get the sds cluster name
+	sdsClusterName := grpcCluster.EnvoyGrpc.ClusterName
+
+	clusterConfig, ok := c.Clusters[sdsClusterName]
+	if !ok {
+		log.DefaultLogger.Errorf("can't use sds to generate client certificates , can not find the cluste config " + sdsClusterName)
+	}
+
+	config.SdsServices = make([]*ClusterConfig, 0, 1)
+	config.SdsServices = append(config.SdsServices, clusterConfig)
+}
+
 func (c *XDSConfig) loadClusters(staticResources *bootstrap.Bootstrap_StaticResources) error {
 	if staticResources == nil {
 		log.DefaultLogger.Errorf("StaticResources is null")
@@ -144,23 +204,55 @@ func (c *XDSConfig) loadClusters(staticResources *bootstrap.Bootstrap_StaticReso
 			config.ConnectTimeout = &duration
 		}
 		config.Address = make([]string, 0, len(cluster.Hosts))
-		for _, host := range cluster.Hosts {
-			if address, ok := host.Address.(*core.Address_SocketAddress); ok {
-				if port, ok := address.SocketAddress.PortSpecifier.(*core.SocketAddress_PortValue); ok {
-					newAddress := fmt.Sprintf("%s:%d", address.SocketAddress.Address, port.PortValue)
-					config.Address = append(config.Address, newAddress)
-				} else {
-					log.DefaultLogger.Warnf("only PortValue supported")
-					continue
+		// istio1.6 support host and loadAssignment
+		if cluster.GetHosts() != nil && len(cluster.GetHosts()) != 0 {
+			for _, host := range cluster.Hosts {
+				c.convertAddress(&config, host)
+			}
+		} else if cluster.GetLoadAssignment() != nil {
+			for _, endpoint := range cluster.GetLoadAssignment().Endpoints {
+				for _, lbEndpoint := range endpoint.LbEndpoints {
+					c.convertAddress(&config, lbEndpoint.GetEndpoint().Address)
 				}
-			} else {
-				log.DefaultLogger.Warnf("only SocketAddress supported")
-				continue
 			}
 		}
+		if len(config.Address) == 0 && config.PipePath == "" {
+			log.DefaultLogger.Errorf("can not find the cluster [%v] endpoint", name)
+			continue
+		}
+
+		if cluster.GetTransportSocket() != nil {
+			// istio 1.6 sidecar use the secure way to connnect to istid(also can use the unsecure way)
+			if sockerConfig, ok := cluster.GetTransportSocket().ConfigType.(*core.TransportSocket_TypedConfig); ok {
+				if config.TlsContext == nil {
+					config.TlsContext = &envoy_api_v2_auth.UpstreamTlsContext{}
+				}
+				ptypes.UnmarshalAny(sockerConfig.TypedConfig, config.TlsContext)
+			}
+		}
+
 		c.Clusters[name] = &config
 	}
 	return nil
+}
+
+func (c *XDSConfig) convertAddress(config *ClusterConfig, coreAddress *core.Address) {
+	if coreAddress == nil || config == nil {
+		return
+	}
+	if address, ok := coreAddress.Address.(*core.Address_SocketAddress); ok {
+		if port, ok := address.SocketAddress.PortSpecifier.(*core.SocketAddress_PortValue); ok {
+			newAddress := fmt.Sprintf("%s:%d", address.SocketAddress.Address, port.PortValue)
+			config.Address = append(config.Address, newAddress)
+		} else {
+			log.DefaultLogger.Warnf("only PortValue supported")
+		}
+	} else if pipe, ok := coreAddress.Address.(*core.Address_Pipe); ok {
+		// domain unix
+		config.PipePath = pipe.Pipe.Path
+	} else {
+		log.DefaultLogger.Warnf("Just support SocketAddress And Pipe")
+	}
 }
 
 // GetEndpoint return an endpoint address by random
@@ -251,17 +343,35 @@ func (c *ADSConfig) getTLSCreds(tlsContext *envoy_api_v2_auth.UpstreamTlsContext
 		return nil, errors.New("can't find trusted ca ")
 	}
 	rootCAPath := tlsContext.CommonTlsContext.GetValidationContext().GetTrustedCa().GetFilename()
-	if len(tlsContext.CommonTlsContext.GetTlsCertificates()) <= 0 {
-		return nil, errors.New("can't find client certificates")
+	if len(tlsContext.CommonTlsContext.GetTlsCertificates()) <= 0 &&
+		len(tlsContext.CommonTlsContext.GetTlsCertificateSdsSecretConfigs()) <= 0 {
+		return nil, errors.New("can't find client certificates or sds secret config")
 	}
-	if tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetCertificateChain() == nil ||
-		tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetPrivateKey() == nil {
-		return nil, errors.New("can't read client certificates fail")
+
+	var certificate tls.Certificate
+	var err error
+	if len(tlsContext.CommonTlsContext.GetTlsCertificates()) > 0 {
+		if tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetCertificateChain() == nil ||
+			tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetPrivateKey() == nil {
+			return nil, errors.New("can't read client certificates fail")
+		}
+		certChainPath := tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetCertificateChain().GetFilename()
+		privateKeyPath := tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetPrivateKey().GetFilename()
+		log.DefaultLogger.Infof("mosn start with tls context,root ca certificate path = %v\n cert chain path = %v\n private key path = %v\n",
+			rootCAPath, certChainPath, privateKeyPath)
+		certificate, err = tls.LoadX509KeyPair(
+			certChainPath,
+			privateKeyPath,
+		)
+	} else if len(tlsContext.CommonTlsContext.GetTlsCertificateSdsSecretConfigs()) > 0 {
+		certificate, err = c.getSDSCertificate(tlsContext)
 	}
-	certChainPath := tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetCertificateChain().GetFilename()
-	privateKeyPath := tlsContext.CommonTlsContext.GetTlsCertificates()[0].GetPrivateKey().GetFilename()
-	log.DefaultLogger.Infof("mosn start with tls context,root ca certificate path = %v\n cert chain path = %v\n private key path = %v\n",
-		rootCAPath, certChainPath, privateKeyPath)
+
+	if err != nil {
+		log.DefaultLogger.Errorf(err.Error())
+		return nil, err
+	}
+
 	certPool := x509.NewCertPool()
 	bs, err := ioutil.ReadFile(rootCAPath)
 	if err != nil {
@@ -271,16 +381,57 @@ func (c *ADSConfig) getTLSCreds(tlsContext *envoy_api_v2_auth.UpstreamTlsContext
 	if !ok {
 		return nil, errors.New("failed to append certs")
 	}
-	certificate, err := tls.LoadX509KeyPair(
-		certChainPath,
-		privateKeyPath,
-	)
+
 	creds := credentials.NewTLS(&tls.Config{
 		ServerName:   "",
 		Certificates: []tls.Certificate{certificate},
 		RootCAs:      certPool,
 	})
 	return creds, nil
+}
+
+func (c *ADSConfig) getSDSCertificate(tlsContext *envoy_api_v2_auth.UpstreamTlsContext) (certificate tls.Certificate, err error) {
+
+	if c.SdsServices == nil || len(c.SdsServices) == 0 {
+		return certificate, errors.New("can not find the sds service")
+	}
+
+	// sds pipe path
+	name := tlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs[0].Name
+	// find the sds cluster config
+	clusterConfig := c.SdsServices[0]
+	// connect to pilot agent(use domain socket)
+	sdsConn, err := grpc.Dial(clusterConfig.PipePath, grpc.WithInsecure(), grpc.WithContextDialer(UnixConnect))
+	if err != nil {
+		return certificate, errors.New("can't use sds to generate client certificates, dial to " + clusterConfig.PipePath + " fail " + err.Error())
+	}
+	response, err := ads.NewSecretDiscoveryServiceClient(sdsConn).FetchSecrets(context.Background(), &xdsapi.DiscoveryRequest{
+		VersionInfo:   "",
+		ResourceNames: []string{name},
+		TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+		ResponseNonce: "",
+		ErrorDetail:   nil,
+		Node: &core.Node{
+			Id:       types.GetGlobalXdsInfo().ServiceNode,
+			Cluster:  types.GetGlobalXdsInfo().ServiceCluster,
+			Metadata: types.GetGlobalXdsInfo().Metadata,
+		},
+	})
+	if err != nil || len(response.Resources) == 0 {
+		return certificate, errors.New("can't use sds to generate client certificates , can not fetch any resources " + err.Error())
+	}
+	secret := &envoy_api_v2_auth.Secret{}
+	err = ptypes.UnmarshalAny(response.Resources[0], secret)
+	if err != nil {
+		return certificate, errors.New("can't use sds to generate client certificates , unmarshal to secret fail " + err.Error())
+	}
+	tlsCert, ok := secret.Type.(*envoy_api_v2_auth.Secret_TlsCertificate)
+	if !ok {
+		return certificate, errors.New("can't use sds to generate client certificates , change to Secret_TlsCertificate fail")
+	}
+	certChainData := tlsCert.TlsCertificate.CertificateChain.Specifier.(*core.DataSource_InlineBytes).InlineBytes
+	privateKeyData := tlsCert.TlsCertificate.PrivateKey.Specifier.(*core.DataSource_InlineBytes).InlineBytes
+	return tls.X509KeyPair(certChainData, privateKeyData)
 }
 
 func (c *ADSConfig) getADSRefreshDelay() *time.Duration {
@@ -298,4 +449,11 @@ func (c *ADSConfig) closeADSStreamClient() {
 	}
 	c.StreamClient.Client = nil
 	c.StreamClient = nil
+}
+
+// Domain unix
+func UnixConnect(context context.Context, addr string) (net.Conn, error) {
+	unix_addr, err := net.ResolveUnixAddr("unix", addr)
+	conn, err := net.DialUnix("unix", nil, unix_addr)
+	return conn, err
 }

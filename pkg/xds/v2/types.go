@@ -40,6 +40,7 @@ type XDSConfig struct {
 type ClusterConfig struct {
 	LbPolicy       envoy_api_v2.Cluster_LbPolicy
 	Address        []string
+	PipePath       string
 	ConnectTimeout *time.Duration
 	TlsContext     *envoy_api_v2_auth.UpstreamTlsContext
 }
@@ -50,6 +51,7 @@ type ADSConfig struct {
 	RefreshDelay *time.Duration
 	Services     []*ServiceConfig
 	StreamClient *StreamClient
+	SdsServices  []*ClusterConfig
 }
 
 // ADSClient communicated with pilot
